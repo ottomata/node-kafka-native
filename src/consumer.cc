@@ -9,26 +9,13 @@
 using namespace v8;
 
 Consumer::Consumer(Local<Object> &options):
-    Common(RD_KAFKA_CONSUMER, options),
-    topic_(nullptr),
-    partitions_(),
-    looper_(nullptr),
-    queue_(nullptr),
-    paused_(false),
-    recv_callback_(),
-    max_messages_per_callback_(10000)
+    Common(RD_KAFKA_CONSUMER, options)
 {
 }
 
 Consumer::~Consumer()
 {
-    if (queue_) {
-        rd_kafka_queue_destroy(queue_);
-        queue_ = nullptr;
-    }
-
-    // rd_kafka_topic_destroy() called in ~Common
-    topic_ = nullptr;
+    // rd_kafka_topic_destroy() and rd_kafka_destroy() called in ~Common
 }
 
 Nan::Persistent<Function> Consumer::constructor;
@@ -42,11 +29,14 @@ Consumer::Init() {
     tpl->SetClassName(Nan::New("Consumer").ToLocalChecked());
     tpl->InstanceTemplate()->SetInternalFieldCount(1);
 
-    Nan::SetPrototypeMethod(tpl, "start", WRAPPED_METHOD_NAME(Start));
-    Nan::SetPrototypeMethod(tpl, "stop", WRAPPED_METHOD_NAME(Stop));
-    Nan::SetPrototypeMethod(tpl, "pause", WRAPPED_METHOD_NAME(Pause));
-    Nan::SetPrototypeMethod(tpl, "resume", WRAPPED_METHOD_NAME(Resume));
-    Nan::SetPrototypeMethod(tpl, "get_metadata", WRAPPED_METHOD_NAME(GetMetadata));
+    Nan::SetPrototypeMethod(tpl, "subscribe", WRAPPED_METHOD_NAME(Subscribe));
+    Nan::SetPrototypeMethod(tpl, "unsubscribe", WRAPPED_METHOD_NAME(Unsubscribe));
+    Nan::SetPrototypeMethod(tpl, "poll", WRAPPED_METHOD_NAME(Poll));
+    Nan::SetPrototypeMethod(tpl, "close", WRAPPED_METHOD_NAME(Poll));
+
+    //  TODO: implement assign, unassign, metadata, etc.
+
+    // Nan::SetPrototypeMethod(tpl, "get_metadata", WRAPPED_METHOD_NAME(GetMetadata));
 
     constructor.Reset(tpl->GetFunction());
 }
@@ -91,373 +81,140 @@ int
 Consumer::consumer_init(std::string *error) {
     Nan::HandleScope scope;
 
-    // Convert persistent options to local for >node 0.12 compatibility
-    Local<Object> options = Nan::New(options_);
-
-    static PersistentString topic_key("topic");
-    Local<String> name = Nan::Get(options, topic_key).ToLocalChecked().As<String>();
-    if (name == Nan::Undefined()) {
-        *error = "options must contain a topic";
-        return -1;
-    }
-
-    static PersistentString recv_cb_key("recv_cb");
-    Local<Function> recv_cb_fn = Nan::Get(options, recv_cb_key).ToLocalChecked().As<Function>();
-    if (recv_cb_fn == Nan::Undefined()) {
-        *error = "options must contain a recv_cb function";
-        return -1;
-    }
-    recv_callback_.reset(new Nan::Callback(recv_cb_fn));
-
-    static PersistentString max_message_key("max_messages_per_callback");
-    Local<Number> max_messages_obj = Nan::Get(options, max_message_key).ToLocalChecked().As<Number>();
-    if (max_messages_obj != Nan::Undefined()) {
-        this->max_messages_per_callback_ = max_messages_obj->Uint32Value();
-    }
-
+    // TODO move init to common?
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
-    rd_kafka_conf_set_opaque(conf, this);
+
+    // rd_kafka_conf_set_opaque(conf, this);
 
     int err = common_init(conf, error);
     if (err) {
         return err;
     }
 
-    String::Utf8Value topic_name(name);
-    topic_ = setup_topic(*topic_name, error);
-    if (!topic_) {
-        return -1;
-    }
-
-    queue_ = rd_kafka_queue_new(kafka_client_);
-
-    start_poll();
-
     return 0;
 }
 
-class ConsumerLoop {
-public:
-    ConsumerLoop(Consumer *consumer, rd_kafka_queue_t *queue):
-        handle_(),
-        consumer_(consumer),
-        queue_(queue),
-        paused_(false),
-        shutdown_(false)
-    {
-        uv_cond_init(&cond_);
-        uv_mutex_init(&mutex_);
-    }
-
-    ~ConsumerLoop()
-    {
-        uv_cond_destroy(&cond_);
-        uv_mutex_destroy(&mutex_);
-    }
-
-    void start() {
-        uv_thread_create(&handle_, ConsumerLoop::main, this);
-    }
-
-    void pause() {
-        uv_mutex_lock(&mutex_);
-        paused_ = true;
-        uv_mutex_unlock(&mutex_);
-    }
-
-    void resume() {
-        uv_mutex_lock(&mutex_);
-        paused_ = false;
-        uv_cond_signal(&cond_);
-        uv_mutex_unlock(&mutex_);
-    }
-
-    void stop() {
-        uv_mutex_lock(&mutex_);
-        shutdown_ = true;
-        uv_cond_signal(&cond_);
-        uv_mutex_unlock(&mutex_);
-    }
-
-    bool stopping() { return shutdown_; }
-
-    static void main(void *_loop) {
-        ConsumerLoop *loop = static_cast<ConsumerLoop*>(_loop);
-        loop->run();
-    }
-
-private:
-    bool should_continue();
-    void run();
-
-    uv_thread_t handle_;
-    uv_cond_t cond_;
-    uv_mutex_t mutex_;
-    Consumer *consumer_;
-    rd_kafka_queue_t *queue_;
-    bool paused_;
-    bool shutdown_;
-};
-
-class RecvEvent : public KafkaEvent {
-public:
-    RecvEvent(Consumer *consumer, ConsumerLoop *looper, std::vector<rd_kafka_message_t*> &&msgs):
-        KafkaEvent(),
-        consumer_(consumer),
-        looper_(looper),
-        msgs_(msgs)
-    {}
-
-    virtual ~RecvEvent() {
-        for (auto &msg : msgs_) {
-            rd_kafka_message_destroy(msg);
-            msg = nullptr;
-        }
-    }
-
-    virtual void v8_cb() {
-        consumer_->receive(looper_, msgs_);
-    }
-
-    Consumer *consumer_;
-    ConsumerLoop *looper_;
-    std::vector<rd_kafka_message_t*> msgs_;
-};
-
-class LooperStopped : public KafkaEvent {
-public:
-    LooperStopped(Consumer *consumer, ConsumerLoop *looper):
-        KafkaEvent(),
-        consumer_(consumer),
-        looper_(looper)
-    {}
-
-    virtual ~LooperStopped() { }
-
-    virtual void v8_cb() {
-        consumer_->looper_stopped(looper_);
-    }
-
-    Consumer *consumer_;
-    ConsumerLoop *looper_;
-};
-
-bool
-ConsumerLoop::should_continue()
-{
-    uv_mutex_lock(&mutex_);
-    if (shutdown_) {
-        uv_mutex_unlock(&mutex_);
-        return false;
-    }
-
-    while (paused_) {
-        uv_cond_wait(&cond_, &mutex_);
-        if (shutdown_) {
-            uv_mutex_unlock(&mutex_);
-            return false;
-        }
-    }
-
-    uv_mutex_unlock(&mutex_);
-    return true;
-}
-
-void
-ConsumerLoop::run()
-{
-    std::vector<rd_kafka_message_t*> vec;
-
-    while (should_continue()) {
-        const uint32_t max_size = consumer_->max_messages_per_callback();
-        const int timeout_ms = 500;
-        vec.resize(max_size);
-        int cnt = rd_kafka_consume_batch_queue(queue_, timeout_ms, &vec[0], max_size);
-        if (cnt > 0) {
-            // Note that some messages may be errors, eg: RD_KAFKA_RESP_ERR__PARTITION_EOF
-            vec.resize(cnt);
-
-            pause();
-            consumer_->ke_push(std::unique_ptr<KafkaEvent>(new RecvEvent(consumer_, this, std::move(vec))));
-        }
-    }
-
-    consumer_->ke_push(std::unique_ptr<KafkaEvent>(new LooperStopped(consumer_, this)));
-}
-
-WRAPPED_METHOD(Consumer, Start) {
+WRAPPED_METHOD(Consumer, Subscribe) {
     Nan::HandleScope scope;
-
-    if (stop_called_) {
-        Nan::ThrowError("already shutdown");
-        return;
-    }
-
-    if (looper_) {
-        Nan::ThrowError("consumer already started");
-        return;
-    }
 
     if (info.Length() != 1 ||
         !( info[0]->IsObject()) ) {
-        Nan::ThrowError("you must specify partition/offsets");
+        Nan::ThrowError("you must specify topics");
         return;
     }
 
-    Local<Object> offsets = info[0].As<Object>();
-    Local<Array> keys = Nan::GetOwnPropertyNames(offsets).ToLocalChecked();
-    for (size_t i = 0; i < keys->Length(); i++) {
-        Local<Value> key = Nan::Get(keys, i).ToLocalChecked();
-        uint32_t partition = key.As<Number>()->Uint32Value();
-        int64_t offset = Nan::Get(offsets, key).ToLocalChecked().As<Number>()->IntegerValue();
-
-        partitions_.push_back(partition);
-        rd_kafka_consume_start_queue(topic_, partition, offset, queue_);
+    Local<Array> topic_list = info[0].As<Array>();
+    rd_kafka_topic_partition_list_t *rd_kafka_topics;
+    rd_kafka_topics = rd_kafka_topic_partition_list_new(topic_list->Length());
+    for (size_t i = 0; i < topic_list->Length(); i++) {
+        Local<Value> topic = Nan::Get(topic_list, i).ToLocalChecked().As<String>();
+        String::Utf8Value utf8_topic(topic);
+        // println("::::subscribing to %s, %s, %s", topic, utf8_topic, utf8_topic.c_str());
+        rd_kafka_topic_partition_list_add(rd_kafka_topics, *utf8_topic, RD_KAFKA_PARTITION_UA);
     }
 
-    paused_ = false;
-    looper_ = new ConsumerLoop(this, queue_);
-    looper_->start();
+    rd_kafka_resp_err_t err = rd_kafka_subscribe(kafka_client_, rd_kafka_topics);
+    rd_kafka_topic_partition_list_destroy(rd_kafka_topics);
+
+    if (err) {
+        std::string error_msg("Failed to set subscription: ");
+        error_msg.append(rd_kafka_err2str(err));
+        Nan::ThrowError(error_msg.c_str());
+        return;
+    }
+
+    // TODO: Update rebalance callbacks
 
     return;
 }
 
-WRAPPED_METHOD(Consumer, Stop) {
+WRAPPED_METHOD(Consumer, Unsubscribe) {
     Nan::HandleScope scope;
 
-    if (stop_called_) {
-        Nan::ThrowError("already shutdown");
+    rd_kafka_resp_err_t err = rd_kafka_unsubscribe(kafka_client_);
+
+    if (err) {
+        std::string error_msg("Failed to remove subscription: ");
+        error_msg.append(rd_kafka_err2str(err));
+        Nan::ThrowError(error_msg.c_str());
         return;
-    }
-
-    stop_called_ = true;
-
-    if (!looper_) {
-        stop_poll();
-        return;
-    }
-
-    // start was called
-    for (size_t i = 0; i < partitions_.size(); ++i) {
-        rd_kafka_consume_stop(topic_, partitions_[i]);
-    }
-
-    partitions_.clear();
-
-    paused_ = true;
-    looper_->stop();
-    looper_ = nullptr;
-
-    return;
-}
-
-void
-Consumer::looper_stopped(ConsumerLoop *looper) {
-    delete looper;
-    looper = nullptr;
-    stop_poll();
-}
-
-WRAPPED_METHOD(Consumer, Pause) {
-    Nan::HandleScope scope;
-
-    if (stop_called_) {
-        Nan::ThrowError("already shutdown");
-        return;
-    }
-
-    if (!looper_) {
-        Nan::ThrowError("consumer not started");
-        return;
-    }
-
-    paused_ = true;
-    looper_->pause();
-
-    return;
-}
-
-WRAPPED_METHOD(Consumer, Resume) {
-    Nan::HandleScope scope;
-
-    if (stop_called_) {
-        Nan::ThrowError("already shutdown");
-        return;
-    }
-
-    if (!looper_) {
-        Nan::ThrowError("consumer not started");
-        return;
-    }
-
-    if (paused_) {
-        paused_ = false;
-        looper_->resume();
     }
 
     return;
 }
 
-WRAPPED_METHOD(Consumer, GetMetadata) {
-    Nan::HandleScope scope;
-    get_metadata(info);
-    return;
-}
-
-void
-Consumer::receive(ConsumerLoop *looper, const std::vector<rd_kafka_message_t*> &vec) {
-    // called in v8 thread
-    Nan::HandleScope scope;
-
-    if (looper->stopping()) {
-        // This message came in after a stop_recv was issued, but before
-        // the consumer thread was shutdown; dont deliver these messages.
-        // Intentionally not checking _paused here, as doing so would cause
-        // us to miss messages if Pause is called outside of the recv_callback
-        // call.
-        return;
-    }
+/**
+ * Calls rd_kafka_consumer_poll and converts the returned
+ * rd_kafka_message_t into an object.
+ */
+v8::Local<v8::Object>
+Consumer::poll(uint32_t timeout_ms) {
+    rd_kafka_message_t *msg;
+    Local<Object> obj = Nan::New<Object>();
 
     static PersistentString topic_key("topic");
     static PersistentString partition_key("partition");
     static PersistentString offset_key("offset");
-    static PersistentString payload_key("payload");
+    static PersistentString value_key("value");
     static PersistentString key_key("key");
     static PersistentString errcode_key("errcode");
+    static PersistentString errname_key("errname");
+    static PersistentString errstr_key("errstr");
 
-    int msg_idx = -1;
-    int err_idx = -1;
-
-    Local<Array> messages = Nan::New<Array>();
-    Local<Array> errors = Nan::New<Array>();
-    for (auto msg : vec) {
-        Local<Object> obj = Nan::New<Object>();
-
+    // TODO: move msg -> object conversion into separate reusable function.
+    msg = rd_kafka_consumer_poll(kafka_client_, timeout_ms);
+    if (msg) {
         Nan::Set(obj, topic_key.handle(), Nan::New<String>(rd_kafka_topic_name(msg->rkt)).ToLocalChecked());
         Nan::Set(obj, partition_key.handle(), Nan::New<Number>(msg->partition));
         Nan::Set(obj, offset_key.handle(), Nan::New<Number>(msg->offset));
 
+        // TODO: should we do an error object with functions like
+        //       confluent-kafka-python?
         if (msg->err) {
             Nan::Set(obj, errcode_key.handle(), Nan::New<Number>(msg->err));
-            Nan::Set(errors, ++err_idx, obj);
-            continue;
+            Nan::Set(obj, errname_key.handle(), Nan::New<String>(rd_kafka_err2name(msg->err)).ToLocalChecked());
+            Nan::Set(obj, errstr_key.handle(), Nan::New<String>(rd_kafka_err2str(msg->err)).ToLocalChecked());
         }
 
         if (msg->key_len) {
             Nan::Set(obj, key_key.handle(), Nan::New<String>((char*)msg->key, msg->key_len).ToLocalChecked());
         }
         if (msg->len) {
-            Nan::Set(obj, payload_key.handle(), Nan::New<String>((char*)msg->payload, msg->len).ToLocalChecked());
+            Nan::Set(obj, value_key.handle(), Nan::New<String>((char*)msg->payload, msg->len).ToLocalChecked());
         }
-        Nan::Set(messages, ++msg_idx, obj);
+
+        rd_kafka_message_destroy(msg);
     }
 
-    if (msg_idx > -1 || err_idx > -1) {
-        Local<Value> argv[] = { messages, errors };
-        recv_callback_->Call(2, argv);
-    }
-
-    if (!paused_) {
-        looper_->resume();
-    }
+    return obj;
 }
+
+WRAPPED_METHOD(Consumer, Poll) {
+    Nan::HandleScope scope;
+
+    // Default timeout_ms to 1 second. TODO: Document
+    uint32_t timeout_ms = 1000;
+
+    // get first arg as Number and then convert to int
+    if (info.Length() == 1 && info[0]->IsNumber()) {
+        timeout_ms = Nan::To<uint32_t>(info[0].As<Number>()).FromJust();
+    }
+
+    // poll for a message and return it
+    info.GetReturnValue().Set(this->poll(timeout_ms));
+    return;
+}
+
+
+WRAPPED_METHOD(Consumer, Close) {
+    Nan::HandleScope scope;
+
+    rd_kafka_consumer_close(kafka_client_);
+    return;
+}
+
+// WRAPPED_METHOD(Consumer, GetMetadata) {
+//     Nan::HandleScope scope;
+//     get_metadata(info);
+//     return;
+// }

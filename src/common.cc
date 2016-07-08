@@ -8,6 +8,10 @@
 
 using namespace v8;
 
+
+// TODO: Do we need special callback threads anymore?
+
+
 void
 #if UV_VERSION_MAJOR == 0
 ke_async_ready(uv_async_t* handle, int status)
@@ -336,28 +340,6 @@ Common::common_init(rd_kafka_conf_t *conf, std::string *error) {
     // Convert persistent options to local for >node 0.12 compatibility
     Local<Object> options = Nan::New(options_);
 
-    // callbacks
-    static PersistentString stat_cb_key("stat_cb");
-    Local<Function> stat_cb_fn = Nan::Get(options, stat_cb_key).ToLocalChecked().As<Function>();
-    if (stat_cb_fn != Nan::Undefined()) {
-        rd_kafka_conf_set_stats_cb(conf, StatEvent::kafka_cb);
-        stat_event_callback_.reset(new Nan::Callback(stat_cb_fn));
-    }
-
-    static PersistentString error_cb_key("error_cb");
-    Local<Function> error_cb_fn = Nan::Get(options, error_cb_key).ToLocalChecked().As<Function>();
-    if (error_cb_fn != Nan::Undefined()) {
-        rd_kafka_conf_set_error_cb(conf, ErrorEvent::kafka_cb);
-        error_event_callback_.reset(new Nan::Callback(error_cb_fn));
-    }
-
-    static PersistentString log_cb_key("log_cb");
-    Local<Function> log_cb_fn = Nan::Get(options, log_cb_key).ToLocalChecked().As<Function>();
-    if (log_cb_fn != Nan::Undefined()) {
-        rd_kafka_conf_set_log_cb(conf, LogEvent::kafka_cb);
-        log_event_callback_.reset(new Nan::Callback(log_cb_fn));
-    }
-
     const int errsize = 512;
     char errstr[errsize];
 
@@ -366,6 +348,7 @@ Common::common_init(rd_kafka_conf_t *conf, std::string *error) {
     // rd_kafka_conf_set(conf, "debug", "generic,broker,producer,queue", errstr, sizeof(errstr));
     // rd_kafka_conf_set(conf, "debug", "topic", errstr, sizeof(errstr));
 
+    /* Configure rdkafka from 'driver_options' */
     static PersistentString driver_options_key("driver_options");
     Local<Object> driver_options = Nan::Get(options, driver_options_key).ToLocalChecked().As<Object>();
     if (driver_options != Nan::Undefined()) {
@@ -376,18 +359,50 @@ Common::common_init(rd_kafka_conf_t *conf, std::string *error) {
             if (val == Nan::Undefined()) {
                 continue;
             }
+
             if (rd_kafka_conf_set(conf, *Nan::Utf8String(key), *Nan::Utf8String(val),
                                     errstr, errsize) != RD_KAFKA_CONF_OK) {
+
                 *error = std::string(errstr);
+                rd_kafka_conf_destroy(conf);
+
+                return -1;
+            }
+        }
+    }
+
+    /* Set default topic configs from 'topic_options' */
+    rd_kafka_topic_conf_t *tconf = rd_kafka_topic_conf_new();
+
+    static PersistentString topic_options_key("topic_options");
+    Local<Object> topic_options = Nan::Get(options, topic_options_key).ToLocalChecked().As<Object>();
+    if (topic_options != Nan::Undefined()) {
+        Local<Array> keys = Nan::GetOwnPropertyNames(topic_options).ToLocalChecked();
+        for (size_t i = 0; i < keys->Length(); i++) {
+            Local<Value> key = Nan::Get(keys, i).ToLocalChecked();
+            Local<Value> val = Nan::Get(topic_options, key).ToLocalChecked();
+            if (val == Nan::Undefined()) {
+                continue;
+            }
+            if (rd_kafka_topic_conf_set(tconf, *Nan::Utf8String(key), *Nan::Utf8String(val),
+                                        errstr, errsize) != RD_KAFKA_CONF_OK) {
+                *error = std::string(errstr);
+                rd_kafka_topic_conf_destroy(tconf);
                 rd_kafka_conf_destroy(conf);
                 return -1;
             }
         }
     }
 
+    rd_kafka_topic_conf_set_opaque(tconf, this);
+    rd_kafka_conf_set_default_topic_conf(conf, tconf);
+
+    rd_kafka_conf_set_opaque(conf, this);
+
     kafka_client_ = rd_kafka_new(ktype_, conf, errstr, sizeof(errstr));
     if (!kafka_client_) {
         *error = std::string(errstr);
+        rd_kafka_topic_conf_destroy(tconf);
         rd_kafka_conf_destroy(conf);
         return -1;
     }

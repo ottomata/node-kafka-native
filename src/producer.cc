@@ -165,7 +165,8 @@ Producer::producer_init(std::string *error_str) {
     Nan::HandleScope scope;
 
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
-    rd_kafka_conf_set_opaque(conf, this);
+    //TODO moved to common?
+    // rd_kafka_conf_set_opaque(conf, this);
 
     Local<Object> options = Nan::New(options_);
 

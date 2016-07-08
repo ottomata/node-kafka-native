@@ -13,26 +13,22 @@ var producer = new kafka_native.Producer({
 });
 
 var consumer = new kafka_native.Consumer({
-    broker: broker,
-    topic: topic,
-    offset_directory: './kafka-offsets',
-    receive_callback: function(data) {
-        data.messages.forEach(function(m) {
-            console.log('message: ', m.topic, m.partition, m.offset, m.payload);
-        });
-        return Promise.resolve();
+    driver_options: {
+        'bootstrap.servers': 'localhost:9092',
+        'group.id': 'mygroup',
+        'enable.auto.commit': false,
+    },
+    topic_options: {
+        'auto.offset.reset': 'smallest',
+        'auto.commit.enable': false,
     }
 });
 
-producer.partition_count(topic)
-.then(function(npartitions) {
-    var partition = 0;
-    setInterval(function() {
-        producer.send(topic, partition++ % npartitions, ['hello']);
-    }, 1000);
+while (true) {
+    recv(consumer.poll());
+}
 
-    return consumer.start();
-});
+# TODO: document produer example
 ```
 
 See the `examples` directory for more.
@@ -79,7 +75,7 @@ The full librdafka JSON statistics object is returned as `rdkafka_stats`, in cas
 
 
 ### Consumer
-The `Consumer` requires a local directory to record processed message offsets, as well as the broker and topic to use. Once a `Consumer` has been created, its `start()` method will initiate pulling messages from Kafka, and feeding them back to the configured `receive_callback`. The `Consumer` will keep trying to pull messages from Kafka in the background, up to the number of kilobytes of memory specified by the `queued_max_messages_kbytes` option, so that it can feed the `receive_callback` as soon as possible.
+TODO: document new consumer
 
 #### Flow control
 When your `receive_callback` returns - or if it returns a Promise, when that Promise is fulfilled _or_ rejected - the message offsets will be recorded locally, to ensure that any future Consumer instances don't ask for that message offset again. This information is recorded as a set of files in the `offset_directory`, one per topic-partition.
